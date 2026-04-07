@@ -1,0 +1,727 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: flutter_local_helper [options]
+
+Options:
+  --root <path>    Project root to scan. Default: .
+  --scan <path>    Relative directory to scan from root. Default: lib
+  --output <path>  Write JSON to a file instead of stdout.
+  --help, -h       Show this help.
+EOF
+}
+
+resolve_dir() {
+  local path="$1"
+  (
+    cd "$path" 2>/dev/null
+    pwd -P
+  )
+}
+
+scan_file() {
+  local file_path="$1"
+  local relative_path="$2"
+
+  perl - "$file_path" "$relative_path" <<'PERL'
+use strict;
+use warnings;
+
+my ($file_path, $relative_path) = @ARGV;
+
+open my $fh, '<', $file_path or die "Failed to read $file_path: $!";
+local $/;
+my $source = <$fh>;
+close $fh;
+
+sub starts_with {
+  my ($source, $value, $index) = @_;
+  return 0 if $index + length($value) > length($source);
+  return substr($source, $index, length($value)) eq $value;
+}
+
+sub current_char {
+  my ($source, $index) = @_;
+  return substr($source, $index, 1);
+}
+
+sub advance_char {
+  my ($char, $line_ref, $column_ref) = @_;
+  if ($char eq "\n") {
+    $$line_ref++;
+    $$column_ref = 1;
+  } else {
+    $$column_ref++;
+  }
+}
+
+sub advance_substring {
+  my ($text, $line_ref, $column_ref) = @_;
+  for my $char (split //, $text) {
+    advance_char($char, $line_ref, $column_ref);
+  }
+}
+
+sub leading_context {
+  my ($source, $start_index) = @_;
+  my $window_start = $start_index - 80;
+  $window_start = 0 if $window_start < 0;
+  return substr($source, $window_start, $start_index - $window_start);
+}
+
+sub decode_escape {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+
+  my $escaped = current_char($source, $$index_ref);
+  if ($escaped eq '') {
+    return '';
+  }
+
+  my $decoded;
+  if ($escaped eq 'n') {
+    $decoded = "\n";
+    $$index_ref++;
+    $$column_ref++;
+    return $decoded;
+  }
+  if ($escaped eq 'r') {
+    $decoded = "\r";
+    $$index_ref++;
+    $$column_ref++;
+    return $decoded;
+  }
+  if ($escaped eq 't') {
+    $decoded = "\t";
+    $$index_ref++;
+    $$column_ref++;
+    return $decoded;
+  }
+  if ($escaped eq 'b') {
+    $decoded = "\x08";
+    $$index_ref++;
+    $$column_ref++;
+    return $decoded;
+  }
+  if ($escaped eq 'f') {
+    $decoded = "\f";
+    $$index_ref++;
+    $$column_ref++;
+    return $decoded;
+  }
+  if ($escaped eq '"' || $escaped eq "'" || $escaped eq '\\' || $escaped eq '$') {
+    $$index_ref++;
+    $$column_ref++;
+    return $escaped;
+  }
+  if ($escaped eq 'u') {
+    if (starts_with($source, 'u{', $$index_ref)) {
+      my $cursor = $$index_ref + 2;
+      my $hex = '';
+      while ($cursor < length($source)) {
+        my $char = current_char($source, $cursor);
+        last if $char eq '}';
+        last if $char !~ /[0-9A-Fa-f]/;
+        $hex .= $char;
+        $cursor++;
+      }
+      if ($hex ne '' && current_char($source, $cursor) eq '}') {
+        my $raw = substr($source, $$index_ref, $cursor - $$index_ref + 1);
+        advance_substring($raw, $line_ref, $column_ref);
+        $$index_ref = $cursor + 1;
+        return chr(hex($hex));
+      }
+    } else {
+      my $hex = substr($source, $$index_ref + 1, 4);
+      if ($hex =~ /\A[0-9A-Fa-f]{4}\z/) {
+        my $raw = substr($source, $$index_ref, 5);
+        advance_substring($raw, $line_ref, $column_ref);
+        $$index_ref += 5;
+        return chr(hex($hex));
+      }
+    }
+  }
+
+  $$index_ref++;
+  $$column_ref++;
+  return $escaped;
+}
+
+sub is_identifier_start {
+  my ($char) = @_;
+  return $char =~ /[A-Za-z_]/ ? 1 : 0;
+}
+
+sub is_identifier_part {
+  my ($char) = @_;
+  return $char =~ /[A-Za-z0-9_]/ ? 1 : 0;
+}
+
+sub read_quote_info {
+  my ($source, $index) = @_;
+  my $raw = 0;
+  my $quote_index = $index;
+
+  if (
+    current_char($source, $index) eq 'r' &&
+    (
+      current_char($source, $index + 1) eq '"' ||
+      current_char($source, $index + 1) eq "'"
+    )
+  ) {
+    $raw = 1;
+    $quote_index++;
+  }
+
+  my $delimiter = current_char($source, $quote_index);
+  return undef if $delimiter ne '"' && $delimiter ne "'";
+
+  my $triple = starts_with($source, $delimiter x 3, $quote_index) ? 1 : 0;
+  my $open_length = $raw ? ($triple ? 4 : 2) : ($triple ? 3 : 1);
+
+  return {
+    raw => $raw,
+    quote_index => $quote_index,
+    delimiter => $delimiter,
+    triple => $triple,
+    open_length => $open_length,
+  };
+}
+
+sub skip_line_comment {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+  while ($$index_ref < length($source) && current_char($source, $$index_ref) ne "\n") {
+    $$index_ref++;
+    $$column_ref++;
+  }
+}
+
+sub skip_block_comment {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+  my $depth = 1;
+  $$index_ref += 2;
+  $$column_ref += 2;
+
+  while ($$index_ref < length($source) && $depth > 0) {
+    if (starts_with($source, '/*', $$index_ref)) {
+      $depth++;
+      $$index_ref += 2;
+      $$column_ref += 2;
+      next;
+    }
+    if (starts_with($source, '*/', $$index_ref)) {
+      $depth--;
+      $$index_ref += 2;
+      $$column_ref += 2;
+      next;
+    }
+
+    my $char = current_char($source, $$index_ref);
+    $$index_ref++;
+    advance_char($char, $line_ref, $column_ref);
+  }
+}
+
+sub skip_string_literal_raw;
+sub skip_interpolation_block;
+
+sub skip_dollar_identifier {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+  $$index_ref++;
+  $$column_ref++;
+
+  while ($$index_ref < length($source) && is_identifier_part(current_char($source, $$index_ref))) {
+    $$index_ref++;
+    $$column_ref++;
+  }
+}
+
+sub skip_interpolation_block {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+  $$index_ref += 2;
+  $$column_ref += 2;
+  my $depth = 1;
+
+  while ($$index_ref < length($source) && $depth > 0) {
+    if (starts_with($source, '//', $$index_ref)) {
+      skip_line_comment($source, $index_ref, $line_ref, $column_ref);
+      next;
+    }
+    if (starts_with($source, '/*', $$index_ref)) {
+      skip_block_comment($source, $index_ref, $line_ref, $column_ref);
+      next;
+    }
+
+    my $quote_info = read_quote_info($source, $$index_ref);
+    if ($quote_info) {
+      skip_string_literal_raw($source, $index_ref, $line_ref, $column_ref);
+      next;
+    }
+
+    my $char = current_char($source, $$index_ref);
+    if ($char eq '{') {
+      $depth++;
+      $$index_ref++;
+      $$column_ref++;
+      next;
+    }
+    if ($char eq '}') {
+      $depth--;
+      $$index_ref++;
+      $$column_ref++;
+      next;
+    }
+
+    $$index_ref++;
+    advance_char($char, $line_ref, $column_ref);
+  }
+}
+
+sub skip_string_literal_raw {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+  my $quote_info = read_quote_info($source, $$index_ref);
+  return if !$quote_info;
+
+  $$index_ref += $quote_info->{open_length};
+  $$column_ref += $quote_info->{open_length};
+
+  while ($$index_ref < length($source)) {
+    my $char = current_char($source, $$index_ref);
+
+    if (!$quote_info->{raw} && $char eq '\\') {
+      $$index_ref++;
+      $$column_ref++;
+      if ($$index_ref < length($source)) {
+        my $escaped = current_char($source, $$index_ref);
+        $$index_ref++;
+        advance_char($escaped, $line_ref, $column_ref);
+      }
+      next;
+    }
+
+    if (!$quote_info->{raw} && $char eq '$') {
+      if (current_char($source, $$index_ref + 1) eq '{') {
+        skip_interpolation_block($source, $index_ref, $line_ref, $column_ref);
+        next;
+      }
+      if (is_identifier_start(current_char($source, $$index_ref + 1))) {
+        skip_dollar_identifier($source, $index_ref, $line_ref, $column_ref);
+        next;
+      }
+    }
+
+    if ($quote_info->{triple}) {
+      if (starts_with($source, $quote_info->{delimiter} x 3, $$index_ref)) {
+        $$index_ref += 3;
+        $$column_ref += 3;
+        last;
+      }
+    } elsif ($char eq $quote_info->{delimiter}) {
+      $$index_ref++;
+      $$column_ref++;
+      last;
+    }
+
+    $$index_ref++;
+    advance_char($char, $line_ref, $column_ref);
+  }
+}
+
+sub parse_string_literal {
+  my ($source, $index_ref, $line_ref, $column_ref) = @_;
+  my $quote_info = read_quote_info($source, $$index_ref);
+  return undef if !$quote_info;
+
+  my $start_index = $$index_ref;
+  my $start_line = $$line_ref;
+  my $start_column = $$column_ref;
+  my $value = '';
+
+  $$index_ref += $quote_info->{open_length};
+  $$column_ref += $quote_info->{open_length};
+
+  while ($$index_ref < length($source)) {
+    my $char = current_char($source, $$index_ref);
+
+    if (!$quote_info->{raw} && $char eq '\\') {
+      $$index_ref++;
+      $$column_ref++;
+      $value .= decode_escape($source, $index_ref, $line_ref, $column_ref);
+      next;
+    }
+
+    if (!$quote_info->{raw} && $char eq '$') {
+      if (current_char($source, $$index_ref + 1) eq '{') {
+        my $segment_start = $$index_ref;
+        my $segment_line = $$line_ref;
+        my $segment_column = $$column_ref;
+        skip_interpolation_block($source, $index_ref, $line_ref, $column_ref);
+        my $raw = substr($source, $segment_start, $$index_ref - $segment_start);
+        $value .= $raw;
+        $$line_ref = $segment_line;
+        $$column_ref = $segment_column;
+        advance_substring($raw, $line_ref, $column_ref);
+        next;
+      }
+      if (is_identifier_start(current_char($source, $$index_ref + 1))) {
+        my $segment_start = $$index_ref;
+        skip_dollar_identifier($source, $index_ref, $line_ref, $column_ref);
+        my $raw = substr($source, $segment_start, $$index_ref - $segment_start);
+        $value .= $raw;
+        next;
+      }
+    }
+
+    if ($quote_info->{triple}) {
+      if (starts_with($source, $quote_info->{delimiter} x 3, $$index_ref)) {
+        $$index_ref += 3;
+        $$column_ref += 3;
+        last;
+      }
+    } elsif ($char eq $quote_info->{delimiter}) {
+      $$index_ref++;
+      $$column_ref++;
+      last;
+    }
+
+    $value .= $char;
+    $$index_ref++;
+    advance_char($char, $line_ref, $column_ref);
+  }
+
+  return {
+    value => $value,
+    line => $start_line,
+    column => $start_column,
+    start_index => $start_index,
+    end_index => $$index_ref,
+    leading_context => leading_context($source, $start_index),
+  };
+}
+
+sub gap_is_only_whitespace_or_comments {
+  my ($segment) = @_;
+
+  while ($segment ne '') {
+    if ($segment =~ s/\A\s+//s) {
+      next;
+    }
+    if ($segment =~ s{\A//[^\n]*(?:\n|\z)}{}s) {
+      next;
+    }
+    if ($segment =~ s{\A/\*.*?\*/}{}s) {
+      next;
+    }
+    return 0;
+  }
+
+  return 1;
+}
+
+sub merge_adjacent_literals {
+  my ($source, $literals_ref) = @_;
+  my @merged;
+
+  for my $literal (@{$literals_ref}) {
+    if (!@merged) {
+      push @merged, { %{$literal} };
+      next;
+    }
+
+    my $previous = $merged[-1];
+    my $gap = substr(
+      $source,
+      $previous->{end_index},
+      $literal->{start_index} - $previous->{end_index},
+    );
+
+    if (gap_is_only_whitespace_or_comments($gap)) {
+      $previous->{value} .= $literal->{value};
+      $previous->{end_index} = $literal->{end_index};
+      next;
+    }
+
+    push @merged, { %{$literal} };
+  }
+
+  return @merged;
+}
+
+sub looks_technical {
+  my ($text) = @_;
+  my $compact = $text;
+  $compact =~ s/^\s+//;
+  $compact =~ s/\s+$//;
+  my $lower = lc $compact;
+
+  my @technical_patterns = (
+    qr/^https?:\/\//,
+    qr{^(asset|assets)/},
+    qr{^[\w./-]+\.(png|jpg|jpeg|gif|svg|webp|json|arb|txt|yaml|yml)$},
+    qr{^[\w./-]+\.(dart|g\.dart|freezed\.dart)$},
+    qr{^[a-z0-9_.-]+@[a-z0-9.-]+\.[a-z]{2,}$},
+    qr/^[a-z0-9_.-]+$/,
+    qr/^[A-Z0-9_]+$/,
+    qr{^[/#].*},
+    qr/^\{.+\}$/,
+    qr/^\[.+\]$/,
+  );
+
+  for my $pattern (@technical_patterns) {
+    return 1 if $compact =~ $pattern;
+  }
+
+  my %technical_terms = map { $_ => 1 } qw(
+    http https asset assets route routes debug trace info warn error
+    json aria svg png jpg jpeg dart
+  );
+
+  return 1 if $technical_terms{$lower};
+  return 0;
+}
+
+sub is_declaration_directive {
+  my ($context) = @_;
+  $context =~ s/\s+$//;
+  return $context =~ /(import|export|part|part of)$/ ? 1 : 0;
+}
+
+sub looks_like_ui_context {
+  my ($context) = @_;
+  $context =~ s/\s+/ /g;
+  my @keywords = (
+    'Text(',
+    'label:',
+    'hint:',
+    'title:',
+    'subtitle:',
+    'tooltip:',
+    'semanticLabel:',
+    'helperText:',
+    'errorText:',
+    'counterText:',
+    'emptyText:',
+    'buttonText:',
+    'dialogTitle:',
+    'message:',
+    'content:',
+  );
+
+  for my $keyword (@keywords) {
+    return 1 if index($context, $keyword) >= 0;
+  }
+
+  return 0;
+}
+
+sub has_interpolation {
+  my ($text) = @_;
+  return $text =~ /\$[A-Za-z_]/ || $text =~ /\$\{/ ? 1 : 0;
+}
+
+sub has_meaningful_literal_near_interpolation {
+  my ($text) = @_;
+  my $literal_only = $text;
+
+  $literal_only =~ s/\$\{[^{}]*\}//g;
+  $literal_only =~ s/\$[A-Za-z_][A-Za-z0-9_]*//g;
+  $literal_only =~ s/[\s\.,!?:;\-+*\/\\|()[\]{}"'`~@#%^&=<>]+//g;
+
+  return $literal_only =~ /[A-Za-zÀ-ÿ0-9]/ ? 1 : 0;
+}
+
+sub is_candidate_literal {
+  my ($literal) = @_;
+  my $text = $literal->{value};
+  $text =~ s/^\s+//;
+  $text =~ s/\s+$//;
+
+  return 0 if $text eq '';
+  return 0 if length($text) < 2;
+  return 0 if looks_technical($text);
+  return 0 if $text !~ /[A-Za-zÀ-ÿ]/;
+  if (has_interpolation($text) && !has_meaningful_literal_near_interpolation($text)) {
+    return 0;
+  }
+
+  my $ui_like_content =
+    index($text, ' ') >= 0 ||
+    $text =~ /[.!?,:;]/ ||
+    $text =~ /[A-ZÀ-Ý]/ ||
+    length($text) >= 12;
+  return 0 if !$ui_like_content;
+
+  my $context = $literal->{leading_context};
+  return 0 if is_declaration_directive($context);
+  return 1 if looks_like_ui_context($context);
+  return 1 if index($text, ' ') >= 0;
+  return 0;
+}
+
+sub escape_json {
+  my ($text) = @_;
+  $text =~ s/\\/\\\\/g;
+  $text =~ s/"/\\"/g;
+  $text =~ s/\n/\\n/g;
+  $text =~ s/\r/\\r/g;
+  $text =~ s/\t/\\t/g;
+  $text =~ s/\f/\\f/g;
+  $text =~ s/\x08/\\b/g;
+  return $text;
+}
+
+my @literals;
+my $index = 0;
+my $line = 1;
+my $column = 1;
+
+while ($index < length($source)) {
+  my $char = current_char($source, $index);
+
+  if ($char eq "\n") {
+    $index++;
+    $line++;
+    $column = 1;
+    next;
+  }
+
+  if (starts_with($source, '//', $index)) {
+    skip_line_comment($source, \$index, \$line, \$column);
+    next;
+  }
+
+  if (starts_with($source, '/*', $index)) {
+    skip_block_comment($source, \$index, \$line, \$column);
+    next;
+  }
+
+  my $literal = parse_string_literal($source, \$index, \$line, \$column);
+  if ($literal) {
+    push @literals, $literal;
+    next;
+  }
+
+  $index++;
+  $column++;
+}
+
+for my $literal (merge_adjacent_literals($source, \@literals)) {
+  next if !is_candidate_literal($literal);
+
+  print '{';
+  print '"file":"' . escape_json($relative_path) . '",';
+  print '"line":' . $literal->{line} . ',';
+  print '"column":' . $literal->{column} . ',';
+  print '"text":"' . escape_json($literal->{value}) . '"';
+  print "}\n";
+}
+PERL
+}
+
+root_path='.'
+scan_path='lib'
+output_path=''
+show_help=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --root)
+      [[ $# -ge 2 ]] || {
+        usage >&2
+        exit 64
+      }
+      root_path="$2"
+      shift 2
+      ;;
+    --scan)
+      [[ $# -ge 2 ]] || {
+        usage >&2
+        exit 64
+      }
+      scan_path="$2"
+      shift 2
+      ;;
+    --output)
+      [[ $# -ge 2 ]] || {
+        usage >&2
+        exit 64
+      }
+      output_path="$2"
+      shift 2
+      ;;
+    --help|-h)
+      show_help=1
+      shift
+      ;;
+    *)
+      printf 'Unknown argument: %s\n\n' "$1" >&2
+      usage >&2
+      exit 64
+      ;;
+  esac
+done
+
+if [[ $show_help -eq 1 ]]; then
+  usage
+  exit 0
+fi
+
+if ! root_abs="$(resolve_dir "$root_path")"; then
+  printf 'Root directory not found: %s\n' "$root_path" >&2
+  exit 2
+fi
+
+if [[ "$scan_path" = /* ]]; then
+  scan_target="$scan_path"
+else
+  scan_target="$root_abs/$scan_path"
+fi
+
+if ! scan_abs="$(resolve_dir "$scan_target")"; then
+  printf 'Scan directory not found: %s\n' "$scan_target" >&2
+  exit 2
+fi
+
+results_file="$(mktemp)"
+payload_file="$(mktemp)"
+trap 'rm -f "$results_file" "$payload_file"' EXIT
+
+count=0
+while IFS= read -r file_path; do
+  relative_path="${file_path#"$root_abs"/}"
+  relative_path="${relative_path#/}"
+  if [[ "$relative_path" == "$file_path" ]]; then
+    relative_path="$file_path"
+  fi
+
+  while IFS= read -r json_line; do
+    [[ -n "$json_line" ]] || continue
+    printf '%s\n' "$json_line" >>"$results_file"
+    count=$((count + 1))
+  done < <(scan_file "$file_path" "$relative_path")
+done < <(find "$scan_abs" -type f -name '*.dart' | LC_ALL=C sort)
+
+{
+  printf '[\n'
+
+  index=0
+  while IFS= read -r json_line; do
+    [[ -n "$json_line" ]] || continue
+    index=$((index + 1))
+    if [[ $index -lt $count ]]; then
+      printf '  %s,\n' "$json_line"
+    else
+      printf '  %s\n' "$json_line"
+    fi
+  done <"$results_file"
+
+  printf ']\n'
+} >"$payload_file"
+
+if [[ -n "$output_path" ]]; then
+  cat "$payload_file" >"$output_path"
+else
+  cat "$payload_file"
+fi
