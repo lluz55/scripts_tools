@@ -84,6 +84,60 @@ func_save() {
         return 1
     fi
 
+    # --- Validação do Nome do Perfil ---
+    if [[ "$name" =~ [:\ ] ]]; then
+        echo "${RED}Erro: O nome do perfil não pode conter ':' ou espaços.${NC}"
+        return 1
+    fi
+
+    # --- Validação do CIDR ---
+    if ! [[ "$cidr" =~ ^[0-9]+$ ]] || [ "$cidr" -lt 0 ] || [ "$cidr" -gt 32 ]; then
+        echo "${RED}Erro: CIDR inválido '${cidr}'. Deve ser um número entre 0 e 32.${NC}"
+        return 1
+    fi
+
+    # --- Validação do Formato do IP ---
+    local ip_regex='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    if ! [[ "$ip" =~ $ip_regex ]]; then
+        echo "${RED}Erro: Formato de IP inválido '${ip}'. Exemplo correto: 192.168.0.2${NC}"
+        return 1
+    fi
+
+    # Valida cada octeto do IP
+    local IFS='.'
+    read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+            echo "${RED}Erro: Octeto inválido no IP '${ip}'. Cada valor deve estar entre 0 e 255.${NC}"
+            return 1
+        fi
+    done
+
+    # --- Validação do Formato do Gateway ---
+    if ! [[ "$gw" =~ $ip_regex ]]; then
+        echo "${RED}Erro: Formato de gateway inválido '${gw}'. Exemplo correto: 192.168.0.1${NC}"
+        return 1
+    fi
+
+    # Valida cada octeto do gateway
+    read -ra gw_octets <<< "$gw"
+    for octet in "${gw_octets[@]}"; do
+        if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+            echo "${RED}Erro: Octeto inválido no gateway '${gw}'. Cada valor deve estar entre 0 e 255.${NC}"
+            return 1
+        fi
+    done
+
+    # --- Validação da Interface (se especificada manualmente) ---
+    if [[ "$5" == "-i" && -n "$6" ]]; then
+        if [ ! -d "/sys/class/net/$iface" ]; then
+            echo "${RED}Erro: Interface de rede '${iface}' não encontrada no sistema.${NC}"
+            echo "Interfaces disponíveis:"
+            ls /sys/class/net/ | sed 's/^/  - /'
+            return 1
+        fi
+    fi
+
     # Verifica se o perfil já existe
     if grep -q "^${name}:" "$PROFILE_FILE" 2>/dev/null; then
         echo "${RED}Erro: O perfil '${name}' já existe.${NC}"
@@ -91,13 +145,18 @@ func_save() {
         return 1
     fi
 
+    # Salva o perfil após todas as validações passarem
     echo "${name}:${ip}:${cidr}:${gw}:${iface}" >> "$PROFILE_FILE"
     echo "${GREEN}Perfil '${name}' salvo com sucesso!${NC}"
+    echo "  ${BLUE}Resumo:${NC}"
+    echo "    - IP/CIDR:   ${ip}/${cidr}"
+    echo "    - Gateway:   ${gw}"
+    echo "    - Interface: ${iface}"
 }
 
 # Lista todos os perfis salvos
 func_list() {
-    if [ ! -f "$PROFILE_FILE" ] || !-s "$PROFILE_FILE" >/dev/null 2>&1; then
+    if [ ! -f "$PROFILE_FILE" ] || [ ! -s "$PROFILE_FILE" ]; then
         echo "${YELLOW}Nenhum perfil salvo encontrado.${NC}"
         return 0
     fi
@@ -161,9 +220,22 @@ apply_network_config() {
     echo "${BLUE}Aplicando configuração na interface '${iface}'...${NC}"
     echo "  - ${GREEN}IP:${NC}      ${ip}/${cidr}"
     echo "  - ${GREEN}Gateway:${NC} ${gw}"
-    
+
+    # Flush e aguarda interface ficar pronta
     ip addr flush dev "$iface"
+    sleep 0.5
+    
+    # Adiciona IP e verifica se foi aplicado
     ip addr add "${ip}/${cidr}" dev "$iface"
+    sleep 0.5
+    
+    # Verifica se o IP foi configurado corretamente
+    if ! ip addr show dev "$iface" | grep -q "${ip}/${cidr}"; then
+        echo "${RED}Erro: Falha ao aplicar IP ${ip}/${cidr} na interface '${iface}'.${NC}"
+        echo "Verifique se a interface existe e está ativa."
+        return 1
+    fi
+    
     ip link set dev "$iface" up
     ip route del default >/dev/null 2>&1 || true
     ip route add default via "$gw" dev "$iface"
@@ -190,9 +262,43 @@ func_set() {
             echo "${RED}Erro: Perfil '${name}' não encontrado.${NC}"
             return 1
         fi
+        
+        # Lê o perfil e valida o formato
+        local profile_line
+        profile_line=$(grep "^${name}:" "$PROFILE_FILE")
+        
+        # Conta o número de campos (deve ser exatamente 5)
+        local field_count
+        field_count=$(echo "$profile_line" | awk -F':' '{print NF}')
+        
+        if [ "$field_count" -ne 5 ]; then
+            echo "${RED}Erro: Perfil '${name}' está corrompido (formato inválido).${NC}"
+            echo "  Campo(s) encontrado(s): ${field_count} (esperado: 5)"
+            echo "  Formato esperado: nome:ip:cidr:gateway:interface"
+            echo "${YELLOW}Use 'delete' para remover este perfil e 'save' para recriá-lo corretamente.${NC}"
+            return 1
+        fi
+        
         # CORREÇÃO: Usa uma variável '_' para consumir o nome do perfil do início da linha
         local _ ip cidr gw iface
         IFS=':' read -r _ ip cidr gw iface < <(grep "^${name}:" "$PROFILE_FILE")
+        
+        # Validação adicional: verifica se campos essenciais não estão vazios
+        if [ -z "$ip" ] || [ -z "$cidr" ] || [ -z "$gw" ] || [ -z "$iface" ]; then
+            echo "${RED}Erro: Perfil '${name}' contém campos vazios.${NC}"
+            echo "  IP: ${ip:-VAZIO}"
+            echo "  CIDR: ${cidr:-VAZIO}"
+            echo "  Gateway: ${gw:-VAZIO}"
+            echo "  Interface: ${iface:-VAZIO}"
+            return 1
+        fi
+        
+        # Valida CIDR numérico
+        if ! [[ "$cidr" =~ ^[0-9]+$ ]]; then
+            echo "${RED}Erro: Perfil '${name}' contém CIDR inválido: '${cidr}'.${NC}"
+            return 1
+        fi
+        
         apply_network_config "$ip" "$cidr" "$gw" "$iface"
     else # Caso contrário, é uma configuração manual
         local ip="$1" cidr="$2" gw="$3" iface="$DEFAULT_INTERFACE"
