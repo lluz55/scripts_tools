@@ -43,9 +43,10 @@ show_help() {
     echo
     echo "${BOLD}Comandos:${NC}"
     echo "  ${YELLOW}set${NC} <perfil>              Aplica uma configuração de um perfil salvo."
-    echo "  ${YELLOW}set${NC} <ip> <cidr> <gw> [-i <if>]  Aplica uma configuração manual."
+    echo "  ${YELLOW}set${NC} <ip> <mask> <gw> [-i <if>]  Aplica uma configuração manual."
+    echo "                            <mask> = CIDR (ex: 24, 16, 8)"
     echo
-    echo "  ${YELLOW}save${NC} <perfil> <ip> <cidr> <gw> [-i <if>]  Salva a configuração como um novo perfil."
+    echo "  ${YELLOW}save${NC} <perfil> <ip> <mask> <gw> [-i <if>]  Salva a configuração como um novo perfil."
     echo "  ${YELLOW}list${NC}                           Lista todos os perfis salvos."
     echo "  ${YELLOW}delete${NC} <perfil>              Apaga um perfil salvo."
     echo
@@ -53,9 +54,12 @@ show_help() {
     echo
     echo "${BOLD}Exemplos:${NC}"
     echo "  $0 save ${GREEN}casa${NC} 192.168.1.50 24 192.168.1.1"
+    echo "  $0 save ${GREEN}trabalho${NC} 10.0.0.100 16 10.0.0.1 -i eth0"
     echo "  sudo $0 set ${GREEN}casa${NC}"
+    echo "  sudo $0 set 192.168.1.50 24 192.168.1.1"
     echo "  sudo $0 set 10.0.0.99 8 10.0.0.1 -i eth1"
     echo "  $0 list"
+    echo "  $0 delete ${GREEN}casa${NC}"
 }
 
 # Garante que o diretório de configuração exista
